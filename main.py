@@ -241,12 +241,13 @@ async def execute_cursor_command_stream(task: CursorTask):
 
                 # Change to the working directory and execute cursor-agent with streaming
                 cmd = [
-                    cursor_agent_path, 
-                    "agent", 
-                    "--print", 
-                    "--output-format", "stream-json",
+                    cursor_agent_path,
+                    "agent",
+                    "--print",
+                    "--output-format",
+                    "stream-json",
                     "--stream-partial-output",
-                    prompt
+                    prompt,
                 ]
 
                 logger.info(f"Executing command: {' '.join(cmd)}")
@@ -263,6 +264,10 @@ async def execute_cursor_command_stream(task: CursorTask):
                     text=True,
                     bufsize=0,  # Unbuffered for real-time output
                     universal_newlines=True,
+                    env={
+                        **os.environ,
+                        "PYTHONUNBUFFERED": "1",
+                    },  # Force unbuffered output
                 )
 
                 print(f"PROCESS STARTED: {process.pid}", flush=True)  # Debug print
@@ -274,32 +279,43 @@ async def execute_cursor_command_stream(task: CursorTask):
                     if line:
                         line = line.strip()
                         if line:
-                            print(f"STREAMING LINE: {repr(line)}", flush=True)  # Debug print
-                            
+                            print(
+                                f"STREAMING LINE: {repr(line)}", flush=True
+                            )  # Debug print
+
                             # Try to parse as JSON and extract content
                             try:
                                 import json
+
                                 data = json.loads(line)
-                                
+
                                 # Handle assistant message content
-                                if data.get('type') == 'assistant' and 'message' in data:
-                                    message = data['message']
-                                    if 'content' in message and isinstance(message['content'], list):
-                                        for content_item in message['content']:
-                                            if isinstance(content_item, dict) and 'text' in content_item:
-                                                text = content_item['text']
+                                if (
+                                    data.get("type") == "assistant"
+                                    and "message" in data
+                                ):
+                                    message = data["message"]
+                                    if "content" in message and isinstance(
+                                        message["content"], list
+                                    ):
+                                        for content_item in message["content"]:
+                                            if (
+                                                isinstance(content_item, dict)
+                                                and "text" in content_item
+                                            ):
+                                                text = content_item["text"]
                                                 if text:
                                                     yield text
                                                     sys.stdout.flush()  # Force immediate output
-                                
+
                                 # Handle other content types
-                                elif 'content' in data:
-                                    content = data['content']
+                                elif "content" in data:
+                                    content = data["content"]
                                     if content:
                                         yield content
                                         sys.stdout.flush()
-                                elif 'delta' in data:
-                                    delta = data['delta']
+                                elif "delta" in data:
+                                    delta = data["delta"]
                                     if delta:
                                         yield delta
                                         sys.stdout.flush()
@@ -312,9 +328,7 @@ async def execute_cursor_command_stream(task: CursorTask):
                         if process.poll() is not None:
                             print("PROCESS FINISHED", flush=True)  # Debug print
                             break
-                        # Small delay to prevent busy waiting
-                        import time
-                        time.sleep(0.01)
+                        # No sleep - read immediately for real-time streaming
 
                 # Wait for process to complete
                 process.wait()
