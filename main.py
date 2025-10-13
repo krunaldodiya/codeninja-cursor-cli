@@ -8,6 +8,7 @@ import os
 import subprocess
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -36,6 +37,18 @@ app.add_middleware(
 )
 
 
+class AgentInfo(BaseModel):
+    """Model for agent information"""
+
+    id: int
+    name: str
+    goal: str
+    responsibilities: str
+    context: Optional[Dict[str, Any]] = None
+    capabilities: Optional[list] = None
+    command_content: str
+
+
 class CursorTask(BaseModel):
     """Model for Cursor CLI tasks"""
 
@@ -44,6 +57,7 @@ class CursorTask(BaseModel):
     task_description: str
     working_directory: Optional[str] = None
     organization_name: Optional[str] = None
+    agents: Optional[list[AgentInfo]] = None
 
 
 class CursorResponse(BaseModel):
@@ -201,7 +215,18 @@ async def execute_cursor_command(task: CursorTask):
 @app.post("/execute-stream")
 async def execute_cursor_command_stream(task: CursorTask):
     """Execute a Cursor CLI command with real-time streaming output"""
-    logger.info(f"Received streaming task: {task.task_description}")
+    logger.info(f"=== FASTAPI RECEIVED PAYLOAD ===")
+    logger.info(f"Task description: {task.task_description}")
+    logger.info(f"Task agents: {task.agents}")
+    logger.info(f"Task project_id: {task.project_id}")
+    logger.info(
+        f"Task organization_id: {getattr(task, 'organization_id', 'Not provided')}"
+    )
+    logger.info(f"Task project_name: {getattr(task, 'project_name', 'Not provided')}")
+    logger.info(
+        f"Task working_directory: {getattr(task, 'working_directory', 'Not provided')}"
+    )
+    logger.info(f"=== END FASTAPI PAYLOAD ===")
 
     try:
         from fastapi.responses import StreamingResponse
@@ -236,8 +261,11 @@ async def execute_cursor_command_stream(task: CursorTask):
                 cursor_agent_path = find_cursor_agent()
                 logger.info(f"Using cursor-agent at: {cursor_agent_path}")
 
-                # Prepare the command: pass the user's text verbatim
+                # Use the task description directly - agent paths are already converted
                 prompt = task.task_description
+                logger.info(f"=== FINAL COMMAND TO CURSOR-AGENT ===")
+                logger.info(f"Full prompt: {prompt}")
+                logger.info(f"=== END COMMAND ===")
 
                 # Change to the working directory and execute cursor-agent with streaming
                 cmd = [
@@ -252,6 +280,9 @@ async def execute_cursor_command_stream(task: CursorTask):
 
                 logger.info(f"Executing command: {' '.join(cmd)}")
                 logger.info(f"Working directory: {working_dir}")
+                logger.info(
+                    f"Command working directory contents: {list(Path(working_dir).iterdir()) if Path(working_dir).exists() else 'Directory does not exist'}"
+                )
                 print(f"COMMAND: {' '.join(cmd)}", flush=True)  # Debug print
                 print(f"PROMPT: {prompt}", flush=True)  # Debug print
 
@@ -386,6 +417,106 @@ async def get_project_info(project_id: int):
         "all_projects": [str(p) for p in project_dirs],
         "files": list(latest_project.iterdir()) if latest_project.is_dir() else [],
     }
+
+
+@app.post("/create-agent")
+async def create_agent(
+    agent: AgentInfo,
+    project_id: int = None,
+    organization_id: int = None,
+    team_member_id: int = None,
+):
+    """Create a new agent and store its command file in project directory"""
+    logger.info(f"Creating agent: {agent.name}")
+
+    try:
+        # Determine project directory
+        if project_id:
+            # Look for existing project directories
+            downloads_path = get_downloads_path()
+            project_pattern = f"task-app-{project_id}-*"
+            project_dirs = list(Path(downloads_path).glob(project_pattern))
+
+            if project_dirs:
+                # Use the latest project directory
+                project_dir = max(project_dirs, key=os.path.getctime)
+            else:
+                # Create new project directory
+                project_dir = (
+                    Path(downloads_path) / f"task-app-{project_id}-{int(time.time())}"
+                )
+                project_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            # Use test project directory
+            project_dir = Path("/home/krunaldodiya/Downloads/test-agent-project")
+            project_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create global .codeninja/{organization_id}/{project_id}/agents directory
+        if organization_id and project_id:
+            # Use global .codeninja directory in user's home directory
+            global_codeninja_dir = Path.home() / ".codeninja"
+            agents_dir = (
+                global_codeninja_dir / str(organization_id) / str(project_id) / "agents"
+            )
+        else:
+            # Fallback to .cursor/commands for backward compatibility
+            agents_dir = project_dir / ".cursor" / "commands"
+
+        agents_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create agent file with clean name
+        agent_filename = agent.name.lower().replace(" ", "_").replace("-", "_") + ".md"
+        agent_file_path = agents_dir / agent_filename
+
+        # Write agent command file
+        with open(agent_file_path, "w") as f:
+            f.write(agent.command_content)
+
+        logger.info(f"Agent command file created: {agent_file_path}")
+
+        return {
+            "success": True,
+            "message": f"Agent {agent.name} created successfully",
+            "command_file_path": str(agent_file_path),
+            "project_directory": str(project_dir),
+            "agents_directory": str(agents_dir),
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating agent: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/agents")
+async def list_agents():
+    """List all available agents"""
+    try:
+        agents_dir = Path(
+            "/home/krunaldodiya/WorkSpace/Code/codeninja/storage/app/agents"
+        )
+
+        if not agents_dir.exists():
+            return {"agents": []}
+
+        agents = []
+        for agent_file in agents_dir.glob("*.md"):
+            with open(agent_file, "r") as f:
+                content = f.read()
+                agents.append(
+                    {
+                        "name": agent_file.stem,
+                        "file_path": str(agent_file),
+                        "content_preview": (
+                            content[:200] + "..." if len(content) > 200 else content
+                        ),
+                    }
+                )
+
+        return {"agents": agents}
+
+    except Exception as e:
+        logger.error(f"Error listing agents: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
