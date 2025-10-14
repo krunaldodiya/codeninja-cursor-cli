@@ -56,6 +56,7 @@ class CursorTask(BaseModel):
     project_name: str
     task_description: str
     working_directory: Optional[str] = None
+    workflow_repository_path: Optional[str] = None
     organization_name: Optional[str] = None
     agents: Optional[list[AgentInfo]] = None
 
@@ -234,28 +235,52 @@ async def execute_cursor_command_stream(task: CursorTask):
 
         def generate_output():
             try:
-                downloads_path = get_downloads_path()
-                working_dir = task.working_directory or downloads_path
+                # Priority: workflow_repository_path > working_directory > Downloads
+                if task.workflow_repository_path:
+                    working_dir = task.workflow_repository_path
+                    logger.info(f"Using workflow repository path: {working_dir}")
 
-                # Find existing project or use downloads directory
-                latest_project_path = None
-                if task.project_id:
-                    # Look for existing project directories
-                    project_pattern = f"task-app-{task.project_id}-*"
-                    project_dirs = list(Path(working_dir).glob(project_pattern))
+                    # Check if the workflow repository directory exists
+                    if not os.path.exists(working_dir):
+                        error_msg = f"Workflow repository directory does not exist: {working_dir}"
+                        logger.error(error_msg)
+                        yield f"\n\n❌ Error: {error_msg}\n"
+                        yield "Please ensure the GitHub repository has been cloned to the specified path.\n"
+                        return
 
-                    if project_dirs:
-                        # Use the latest project directory
-                        latest_project_path = max(project_dirs, key=os.path.getctime)
-                        working_dir = str(latest_project_path)
-                        logger.info(f"Found existing project: {latest_project_path}")
-                    else:
-                        logger.info(
-                            f"No existing project found for ID {task.project_id}, using Downloads directory"
-                        )
+                    if not os.path.isdir(working_dir):
+                        error_msg = f"Workflow repository path is not a directory: {working_dir}"
+                        logger.error(error_msg)
+                        yield f"\n\n❌ Error: {error_msg}\n"
+                        return
+                else:
+                    # Fallback to old behavior for backward compatibility
+                    downloads_path = get_downloads_path()
+                    working_dir = task.working_directory or downloads_path
 
-                # Ensure working directory exists
-                os.makedirs(working_dir, exist_ok=True)
+                    # Find existing project or use downloads directory
+                    latest_project_path = None
+                    if task.project_id:
+                        # Look for existing project directories
+                        project_pattern = f"task-app-{task.project_id}-*"
+                        project_dirs = list(Path(working_dir).glob(project_pattern))
+
+                        if project_dirs:
+                            # Use the latest project directory
+                            latest_project_path = max(
+                                project_dirs, key=os.path.getctime
+                            )
+                            working_dir = str(latest_project_path)
+                            logger.info(
+                                f"Found existing project: {latest_project_path}"
+                            )
+                        else:
+                            logger.info(
+                                f"No existing project found for ID {task.project_id}, using Downloads directory"
+                            )
+
+                    # Ensure working directory exists
+                    os.makedirs(working_dir, exist_ok=True)
 
                 # Find cursor-agent
                 cursor_agent_path = find_cursor_agent()
