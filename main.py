@@ -305,6 +305,13 @@ async def execute_cursor_command_stream(task: CursorTask):
 
                 # Stream output line by line for JSON streaming
                 print("STARTING STREAMING LOOP", flush=True)  # Debug print
+                seen_content = set()  # Track seen content to avoid duplication
+                complete_response_received = (
+                    False  # Track if we've received a complete response
+                )
+                collected_content = []  # Collect all content chunks
+                last_output = ""  # Track last output to detect duplicates
+                current_response = ""  # Track current complete response
                 while True:
                     line = process.stdout.readline()
                     if line:
@@ -319,6 +326,10 @@ async def execute_cursor_command_stream(task: CursorTask):
                                 import json
 
                                 data = json.loads(line)
+
+                                # Skip result type messages to avoid duplication
+                                if data.get("type") == "result":
+                                    continue
 
                                 # Handle assistant message content
                                 if (
@@ -335,19 +346,44 @@ async def execute_cursor_command_stream(task: CursorTask):
                                                 and "text" in content_item
                                             ):
                                                 text = content_item["text"]
-                                                if text:
+
+                                                # Only stream individual chunks, not complete responses
+                                                # Complete responses are typically very long (> 500 chars)
+                                                # and contain all the chunks we've already streamed
+                                                if len(text) > 500:
+                                                    # Skip complete responses - we've already streamed the chunks
+                                                    print(
+                                                        f"SKIPPING LONG TEXT: {len(text)} chars",
+                                                        flush=True,
+                                                    )
+                                                    continue
+
+                                                # Only output if we haven't seen this exact text before
+                                                if text not in seen_content:
+                                                    print(
+                                                        f"STREAMING NEW TEXT: '{text[:50]}...' ({len(text)} chars)",
+                                                        flush=True,
+                                                    )
+                                                    seen_content.add(text)
                                                     yield text
-                                                    sys.stdout.flush()  # Force immediate output
+                                                    sys.stdout.flush()
+                                                else:
+                                                    print(
+                                                        f"SKIPPING DUPLICATE: '{text[:50]}...' ({len(text)} chars)",
+                                                        flush=True,
+                                                    )
 
                                 # Handle other content types
                                 elif "content" in data:
                                     content = data["content"]
-                                    if content:
+                                    if content and content not in seen_content:
+                                        seen_content.add(content)
                                         yield content
                                         sys.stdout.flush()
                                 elif "delta" in data:
                                     delta = data["delta"]
-                                    if delta:
+                                    if delta and delta not in seen_content:
+                                        seen_content.add(delta)
                                         yield delta
                                         sys.stdout.flush()
                             except json.JSONDecodeError:
