@@ -6,16 +6,15 @@ A FastAPI service that receives prompts from Laravel and executes them using Cur
 
 import os
 import subprocess
-import json
 import logging
 import time
+import shutil
 from pathlib import Path
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import uvicorn
-import asyncio
+from uvicorn import run
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,44 +36,165 @@ app.add_middleware(
 )
 
 
-class AgentInfo(BaseModel):
-    """Model for agent information"""
+class GitHubRepository(BaseModel):
+    """Model for GitHub repository information"""
 
-    id: int
-    name: str
-    goal: str
-    responsibilities: str
-    context: Optional[Dict[str, Any]] = None
-    capabilities: Optional[list] = None
-    command_content: str
+    repository_owner: str
+    repository_name: str
+    repository_full_name: str
+    repository_access_token: str
+    git_clone_ssh_url: Optional[str] = None
 
 
-class CursorTask(BaseModel):
-    """Model for Cursor CLI tasks"""
+class TestAgentRequest(BaseModel):
+    """Model for agent execution requests"""
 
-    project_id: int
-    project_name: str
-    task_description: str
-    working_directory: Optional[str] = None
-    workflow_repository_path: Optional[str] = None
-    organization_name: Optional[str] = None
-    agents: Optional[list[AgentInfo]] = None
+    agent: str
+    task: str
+    prompt: str
 
 
-class CursorResponse(BaseModel):
-    """Model for Cursor CLI responses"""
-
-    success: bool
-    output: str
-    error: Optional[str] = None
-    project_path: Optional[str] = None
+def get_working_directory() -> str:
+    """Get the current working directory path"""
+    return os.getcwd()
 
 
-def get_downloads_path() -> str:
-    """Get the user's Downloads directory path"""
+def get_workflow_working_directory(project_id: int, workflow_id: int) -> str:
+    """Get working directory from config.json for a specific workflow"""
+    try:
+        import json
+
+        codeninja_dir = Path.home() / ".codeninja"
+        config_file_path = codeninja_dir / "config.json"
+
+        if not config_file_path.exists():
+            logger.info("No config file found, using current directory")
+            return os.getcwd()
+
+        with open(config_file_path, "r") as f:
+            config = json.load(f)
+
+        workflow_key = f"project_{project_id}_workflow_{workflow_id}"
+        if workflow_key not in config:
+            logger.info(
+                f"No config found for workflow {workflow_key}, using current directory"
+            )
+            return os.getcwd()
+
+        workflow_config = config[workflow_key]
+        working_dir = workflow_config.get("working_directory")
+
+        if not working_dir or not os.path.exists(working_dir):
+            logger.warning(
+                f"Config found but directory doesn't exist: {working_dir}, using current directory"
+            )
+            return os.getcwd()
+
+        logger.info(f"Found workflow directory from config: {working_dir}")
+
+        # Update last_accessed timestamp
+        config[workflow_key]["last_accessed"] = time.time()
+        try:
+            with open(config_file_path, "w") as f:
+                json.dump(config, f, indent=2)
+        except IOError as e:
+            logger.warning(f"Failed to update config timestamp: {e}")
+
+        return working_dir
+
+    except Exception as e:
+        logger.warning(f"Error reading config file: {e}, using current directory")
+        return os.getcwd()
+
+
+def generate_ssh_url(repository_full_name: str, repository_access_token: str) -> str:
+    """Generate SSH URL with token from repository full name"""
+    # Convert full name to SSH format with token
+    # Format: git@github.com:username/repo.git
+    # With token: https://token@github.com/username/repo.git
+    return f"https://{repository_access_token}@github.com/{repository_full_name}.git"
+
+
+def get_codeninja_repo_path(repo_name: str) -> str:
+    """Get the CodeNinja repository path"""
     home = os.path.expanduser("~")
-    downloads = os.path.join(home, "Downloads")
-    return downloads
+    return os.path.join(home, ".codeninja", repo_name)
+
+
+def validate_git_repository(repo_path: str) -> bool:
+    """Validate that the path is a proper git repository"""
+    if not os.path.exists(repo_path) or not os.path.isdir(repo_path):
+        return False
+
+    git_path = os.path.join(repo_path, ".git")
+    if not os.path.exists(git_path):
+        return False
+
+    # Additional validation: check if git commands work
+    try:
+        result = subprocess.run(
+            ["git", "status"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def clone_repository_if_needed(repo_name: str, ssh_url: str) -> str:
+    """Clone repository if it doesn't exist in ~/.codeninja/{repo_name}"""
+    repo_path = get_codeninja_repo_path(repo_name)
+
+    # Check if repository already exists and is valid
+    if validate_git_repository(repo_path):
+        logger.info(f"Valid git repository already exists at: {repo_path}")
+        return repo_path
+    elif os.path.exists(repo_path):
+        logger.warning(
+            f"Directory exists but is not a valid git repository: {repo_path}"
+        )
+        # Remove the directory and clone fresh
+        shutil.rmtree(repo_path)
+
+    # Create .codeninja directory if it doesn't exist
+    codeninja_dir = os.path.dirname(repo_path)
+    os.makedirs(codeninja_dir, exist_ok=True)
+
+    # Clone the repository
+    logger.info(f"Cloning repository from: {ssh_url}")
+    logger.info(f"To directory: {repo_path}")
+
+    try:
+        result = subprocess.run(
+            ["git", "clone", ssh_url, repo_path],
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout
+        )
+
+        if result.returncode == 0:
+            # Validate the cloned repository
+            if validate_git_repository(repo_path):
+                logger.info(
+                    f"Successfully cloned and validated repository at: {repo_path}"
+                )
+                return repo_path
+            else:
+                logger.error(f"Cloned repository failed validation: {repo_path}")
+                raise Exception("Cloned repository is not valid")
+        else:
+            logger.error(f"Failed to clone repository: {result.stderr}")
+            raise Exception(f"Git clone failed: {result.stderr}")
+
+    except subprocess.TimeoutExpired:
+        logger.error("Git clone timed out after 5 minutes")
+        raise Exception("Git clone timed out")
+    except Exception as e:
+        logger.error(f"Error cloning repository: {str(e)}")
+        raise Exception(f"Error cloning repository: {str(e)}")
 
 
 def find_cursor_agent() -> str:
@@ -102,76 +222,6 @@ def find_cursor_agent() -> str:
     raise FileNotFoundError("cursor-agent not found. Please install Cursor CLI.")
 
 
-def execute_cursor_task(task: CursorTask) -> CursorResponse:
-    """Execute a task using Cursor CLI"""
-    try:
-        # Get the working directory
-        downloads_path = get_downloads_path()
-        working_dir = task.working_directory or downloads_path
-
-        # Find existing project or use downloads directory
-        if task.project_id:
-            # Look for existing project directories
-            project_pattern = f"task-app-{task.project_id}-*"
-            project_dirs = list(Path(working_dir).glob(project_pattern))
-
-            if project_dirs:
-                # Use the latest project directory
-                latest_project = max(project_dirs, key=os.path.getctime)
-                working_dir = str(latest_project)
-                logger.info(f"Found existing project: {latest_project}")
-            else:
-                logger.info(
-                    f"No existing project found for ID {task.project_id}, using Downloads directory"
-                )
-
-        # Ensure working directory exists
-        os.makedirs(working_dir, exist_ok=True)
-
-        # Find cursor-agent
-        cursor_agent_path = find_cursor_agent()
-        logger.info(f"Using cursor-agent at: {cursor_agent_path}")
-
-        # Prepare the command: pass the user's text verbatim
-        prompt = task.task_description
-
-        # Change to the working directory and execute cursor-agent
-        cmd = [cursor_agent_path, "agent", "--print", prompt]
-
-        logger.info(f"Executing command: {' '.join(cmd)}")
-        logger.info(f"Working directory: {working_dir}")
-
-        # Execute the command
-        result = subprocess.run(
-            cmd,
-            cwd=working_dir,
-            capture_output=True,
-            text=True,
-            timeout=300,  # 5 minute timeout
-        )
-
-        return CursorResponse(
-            success=result.returncode == 0,
-            output=result.stdout,
-            error=result.stderr if result.returncode != 0 else None,
-            project_path=working_dir,
-        )
-
-    except subprocess.TimeoutExpired:
-        return CursorResponse(
-            success=False, output="", error="Command timed out after 5 minutes"
-        )
-    except FileNotFoundError as e:
-        return CursorResponse(
-            success=False, output="", error=f"Cursor CLI not found: {str(e)}"
-        )
-    except Exception as e:
-        logger.error(f"Error executing cursor task: {str(e)}")
-        return CursorResponse(
-            success=False, output="", error=f"Unexpected error: {str(e)}"
-        )
-
-
 @app.get("/")
 async def root():
     """Health check endpoint"""
@@ -187,112 +237,64 @@ async def health_check():
     """Detailed health check"""
     try:
         cursor_agent_path = find_cursor_agent()
-        downloads_path = get_downloads_path()
+        current_dir = os.getcwd()
 
         return {
             "status": "healthy",
             "cursor_agent_path": cursor_agent_path,
-            "downloads_path": downloads_path,
-            "downloads_exists": os.path.exists(downloads_path),
+            "current_directory": current_dir,
+            "current_dir_exists": os.path.exists(current_dir),
         }
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
 
 
-@app.post("/execute", response_model=CursorResponse)
-async def execute_cursor_command(task: CursorTask):
-    """Execute a Cursor CLI command"""
-    logger.info(f"Received task: {task.task_description}")
-
-    try:
-        result = execute_cursor_task(task)
-        logger.info(f"Task completed with success: {result.success}")
-        return result
-    except Exception as e:
-        logger.error(f"Error processing task: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/execute-stream")
-async def execute_cursor_command_stream(task: CursorTask):
-    """Execute a Cursor CLI command with real-time streaming output"""
-    logger.info(f"=== FASTAPI RECEIVED PAYLOAD ===")
-    logger.info(f"Task description: {task.task_description}")
-    logger.info(f"Task agents: {task.agents}")
-    logger.info(f"Task project_id: {task.project_id}")
-    logger.info(
-        f"Task organization_id: {getattr(task, 'organization_id', 'Not provided')}"
-    )
-    logger.info(f"Task project_name: {getattr(task, 'project_name', 'Not provided')}")
-    logger.info(
-        f"Task working_directory: {getattr(task, 'working_directory', 'Not provided')}"
-    )
-    logger.info(f"=== END FASTAPI PAYLOAD ===")
+@app.post("/projects/{project_id}/workflows/{workflow_id}/execute")
+async def execute_workflow_command(
+    project_id: int, workflow_id: int, request: TestAgentRequest
+):
+    """Execute a Cursor CLI command with agent context and streaming response for specific workflow"""
+    logger.info(f"Executing agent with goal: {request.agent}")
+    logger.info(f"Task: {request.task}")
+    logger.info(f"Prompt: {request.prompt}")
+    logger.info(f"Project ID: {project_id}")
+    logger.info(f"Workflow ID: {workflow_id}")
 
     try:
         from fastapi.responses import StreamingResponse
         import sys
+        import json
 
         def generate_output():
             try:
-                # Priority: workflow_repository_path > working_directory > Downloads
-                if task.workflow_repository_path:
-                    working_dir = task.workflow_repository_path
-                    logger.info(f"Using workflow repository path: {working_dir}")
-
-                    # Check if the workflow repository directory exists
-                    if not os.path.exists(working_dir):
-                        error_msg = f"Workflow repository directory does not exist: {working_dir}"
-                        logger.error(error_msg)
-                        yield f"\n\n❌ Error: {error_msg}\n"
-                        yield "Please ensure the GitHub repository has been cloned to the specified path.\n"
-                        return
-
-                    if not os.path.isdir(working_dir):
-                        error_msg = f"Workflow repository path is not a directory: {working_dir}"
-                        logger.error(error_msg)
-                        yield f"\n\n❌ Error: {error_msg}\n"
-                        return
-                else:
-                    # Fallback to old behavior for backward compatibility
-                    downloads_path = get_downloads_path()
-                    working_dir = task.working_directory or downloads_path
-
-                    # Find existing project or use downloads directory
-                    latest_project_path = None
-                    if task.project_id:
-                        # Look for existing project directories
-                        project_pattern = f"task-app-{task.project_id}-*"
-                        project_dirs = list(Path(working_dir).glob(project_pattern))
-
-                        if project_dirs:
-                            # Use the latest project directory
-                            latest_project_path = max(
-                                project_dirs, key=os.path.getctime
-                            )
-                            working_dir = str(latest_project_path)
-                            logger.info(
-                                f"Found existing project: {latest_project_path}"
-                            )
-                        else:
-                            logger.info(
-                                f"No existing project found for ID {task.project_id}, using Downloads directory"
-                            )
-
-                    # Ensure working directory exists
-                    os.makedirs(working_dir, exist_ok=True)
+                # Determine working directory - always use config.json with path parameters
+                # Use config.json to get working directory for the specific workflow
+                working_dir = get_workflow_working_directory(project_id, workflow_id)
 
                 # Find cursor-agent
                 cursor_agent_path = find_cursor_agent()
                 logger.info(f"Using cursor-agent at: {cursor_agent_path}")
 
-                # Use the task description directly - agent paths are already converted
-                prompt = task.task_description
-                logger.info(f"=== FINAL COMMAND TO CURSOR-AGENT ===")
-                logger.info(f"Full prompt: {prompt}")
-                logger.info(f"=== END COMMAND ===")
+                # Create the full prompt with agent context and working directory info
+                context_parts = [f"Agent Context: {request.agent}"]
+                context_parts.append(f"Current Working Directory: {working_dir}")
+                context_parts.append(f"Project ID: {project_id}")
+                context_parts.append(f"Workflow ID: {workflow_id}")
+                context_parts.append("Repository Type: Project Repository")
 
-                # Change to the working directory and execute cursor-agent with streaming
+                context = "\n".join(context_parts)
+
+                full_prompt = f"""{context}
+
+Task: {request.task}
+
+Prompt: {request.prompt}
+
+Please respond as the agent described in the context above."""
+
+                logger.info(f"Full prompt: {full_prompt}")
+
+                # Execute cursor-agent with streaming output
                 cmd = [
                     cursor_agent_path,
                     "agent",
@@ -300,16 +302,11 @@ async def execute_cursor_command_stream(task: CursorTask):
                     "--output-format",
                     "stream-json",
                     "--stream-partial-output",
-                    prompt,
+                    full_prompt,
                 ]
 
                 logger.info(f"Executing command: {' '.join(cmd)}")
                 logger.info(f"Working directory: {working_dir}")
-                logger.info(
-                    f"Command working directory contents: {list(Path(working_dir).iterdir()) if Path(working_dir).exists() else 'Directory does not exist'}"
-                )
-                print(f"COMMAND: {' '.join(cmd)}", flush=True)  # Debug print
-                print(f"PROMPT: {prompt}", flush=True)  # Debug print
 
                 # Execute the command with real-time streaming output
                 process = subprocess.Popen(
@@ -326,30 +323,20 @@ async def execute_cursor_command_stream(task: CursorTask):
                     },  # Force unbuffered output
                 )
 
-                print(f"PROCESS STARTED: {process.pid}", flush=True)  # Debug print
+                logger.info(f"Process started with PID: {process.pid}")
 
                 # Stream output line by line for JSON streaming
-                print("STARTING STREAMING LOOP", flush=True)  # Debug print
                 seen_content = set()  # Track seen content to avoid duplication
-                complete_response_received = (
-                    False  # Track if we've received a complete response
-                )
-                collected_content = []  # Collect all content chunks
-                last_output = ""  # Track last output to detect duplicates
-                current_response = ""  # Track current complete response
+
                 while True:
                     line = process.stdout.readline()
                     if line:
                         line = line.strip()
                         if line:
-                            print(
-                                f"STREAMING LINE: {repr(line)}", flush=True
-                            )  # Debug print
+                            logger.debug(f"Streaming line: {repr(line)}")
 
                             # Try to parse as JSON and extract content
                             try:
-                                import json
-
                                 data = json.loads(line)
 
                                 # Skip result type messages to avoid duplication
@@ -373,30 +360,14 @@ async def execute_cursor_command_stream(task: CursorTask):
                                                 text = content_item["text"]
 
                                                 # Only stream individual chunks, not complete responses
-                                                # Complete responses are typically very long (> 500 chars)
-                                                # and contain all the chunks we've already streamed
                                                 if len(text) > 500:
-                                                    # Skip complete responses - we've already streamed the chunks
-                                                    print(
-                                                        f"SKIPPING LONG TEXT: {len(text)} chars",
-                                                        flush=True,
-                                                    )
                                                     continue
 
                                                 # Only output if we haven't seen this exact text before
                                                 if text not in seen_content:
-                                                    print(
-                                                        f"STREAMING NEW TEXT: '{text[:50]}...' ({len(text)} chars)",
-                                                        flush=True,
-                                                    )
                                                     seen_content.add(text)
                                                     yield text
                                                     sys.stdout.flush()
-                                                else:
-                                                    print(
-                                                        f"SKIPPING DUPLICATE: '{text[:50]}...' ({len(text)} chars)",
-                                                        flush=True,
-                                                    )
 
                                 # Handle other content types
                                 elif "content" in data:
@@ -418,16 +389,13 @@ async def execute_cursor_command_stream(task: CursorTask):
                     else:
                         # Check if process is still running
                         if process.poll() is not None:
-                            print("PROCESS FINISHED", flush=True)  # Debug print
+                            logger.info("Process finished")
                             break
-                        # No sleep - read immediately for real-time streaming
 
                 # Wait for process to complete
                 process.wait()
 
-                print(
-                    f"PROCESS COMPLETED: returncode={process.returncode}", flush=True
-                )  # Debug print
+                logger.info(f"Process completed with return code: {process.returncode}")
 
                 if process.returncode == 0:
                     yield "\n\n✅ Task completed successfully!\n"
@@ -450,135 +418,135 @@ async def execute_cursor_command_stream(task: CursorTask):
         )
 
     except Exception as e:
-        logger.error(f"Error in /execute-stream endpoint: {str(e)}")
+        logger.error(f"Error in /execute endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/projects/{project_id}")
-async def get_project_info(project_id: int):
-    """Get information about a project"""
-    downloads_path = get_downloads_path()
-    project_pattern = f"task-app-{project_id}-*"
-    project_dirs = list(Path(downloads_path).glob(project_pattern))
-
-    if not project_dirs:
-        return {
-            "project_id": project_id,
-            "exists": False,
-            "message": "No projects found",
-        }
-
-    # Get the latest project
-    latest_project = max(project_dirs, key=os.path.getctime)
-
-    return {
-        "project_id": project_id,
-        "exists": True,
-        "latest_project": str(latest_project),
-        "all_projects": [str(p) for p in project_dirs],
-        "files": list(latest_project.iterdir()) if latest_project.is_dir() else [],
-    }
-
-
-@app.post("/create-agent")
-async def create_agent(
-    agent: AgentInfo,
-    project_id: int = None,
-    organization_id: int = None,
-    team_member_id: int = None,
+@app.post("/projects/{project_id}/workflows/{workflow_id}/initialize")
+async def initialize_workflow(
+    project_id: int, workflow_id: int, github_repository: GitHubRepository
 ):
-    """Create a new agent and store its command file in project directory"""
-    logger.info(f"Creating agent: {agent.name}")
+    """Initialize a workflow by cloning GitHub repository and managing config"""
+    logger.info(
+        f"Initializing workflow {workflow_id} for project {project_id} with GitHub repository: {github_repository.repository_name}"
+    )
 
     try:
-        # Determine project directory
-        if project_id:
-            # Look for existing project directories
-            downloads_path = get_downloads_path()
-            project_pattern = f"task-app-{project_id}-*"
-            project_dirs = list(Path(downloads_path).glob(project_pattern))
+        import json
 
-            if project_dirs:
-                # Use the latest project directory
-                project_dir = max(project_dirs, key=os.path.getctime)
+        # Get config file path
+        codeninja_dir = Path.home() / ".codeninja"
+        config_file_path = codeninja_dir / "config.json"
+
+        # Ensure .codeninja directory exists
+        codeninja_dir.mkdir(exist_ok=True)
+
+        # Load existing config or create new one
+        config = {}
+        if config_file_path.exists():
+            try:
+                with open(config_file_path, "r") as f:
+                    config = json.load(f)
+                logger.info(f"Loaded existing config from: {config_file_path}")
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Failed to load config file: {e}, creating new config")
+                config = {}
+
+        # Create workflow key
+        workflow_key = f"project_{project_id}_workflow_{workflow_id}"
+
+        # Check if workflow is already initialized
+        if workflow_key in config:
+            existing_config = config[workflow_key]
+            existing_working_dir = existing_config.get("working_directory")
+            existing_repo_name = existing_config.get("repository_name")
+
+            # Verify if the existing directory exists and matches
+            if (
+                existing_working_dir
+                and os.path.exists(existing_working_dir)
+                and existing_repo_name == github_repository.repository_name
+            ):
+
+                logger.info(
+                    f"Workflow {workflow_id} already initialized with matching repository"
+                )
+                return {
+                    "success": True,
+                    "project_id": project_id,
+                    "workflow_id": workflow_id,
+                    "repository_path": existing_working_dir,
+                    "repository_name": github_repository.repository_name,
+                    "repository_owner": github_repository.repository_owner,
+                    "message": f"Workflow {workflow_id} for project {project_id} already initialized with repository {github_repository.repository_name}",
+                    "already_initialized": True,
+                }
             else:
-                # Create new project directory
-                project_dir = (
-                    Path(downloads_path) / f"task-app-{project_id}-{int(time.time())}"
+                logger.info(
+                    f"Existing workflow config found but directory/repo mismatch, reinitializing"
                 )
-                project_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            # Use test project directory
-            project_dir = Path("/home/krunaldodiya/Downloads/test-agent-project")
-            project_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create global .codeninja/{organization_id}/{project_id}/agents directory
-        if organization_id and project_id:
-            # Use global .codeninja directory in user's home directory
-            global_codeninja_dir = Path.home() / ".codeninja"
-            agents_dir = (
-                global_codeninja_dir / str(organization_id) / str(project_id) / "agents"
-            )
-        else:
-            # Fallback to .cursor/commands for backward compatibility
-            agents_dir = project_dir / ".cursor" / "commands"
-
-        agents_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create agent file with clean name
-        agent_filename = agent.name.lower().replace(" ", "_").replace("-", "_") + ".md"
-        agent_file_path = agents_dir / agent_filename
-
-        # Write agent command file
-        with open(agent_file_path, "w") as f:
-            f.write(agent.command_content)
-
-        logger.info(f"Agent command file created: {agent_file_path}")
-
-        return {
-            "success": True,
-            "message": f"Agent {agent.name} created successfully",
-            "command_file_path": str(agent_file_path),
-            "project_directory": str(project_dir),
-            "agents_directory": str(agents_dir),
-        }
-
-    except Exception as e:
-        logger.error(f"Error creating agent: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/agents")
-async def list_agents():
-    """List all available agents"""
-    try:
-        agents_dir = Path(
-            "/home/krunaldodiya/WorkSpace/Code/codeninja/storage/app/agents"
+        # Generate SSH URL with token
+        ssh_url = generate_ssh_url(
+            github_repository.repository_full_name,
+            github_repository.repository_access_token,
         )
+        logger.info(f"Generated SSH URL: {ssh_url}")
 
-        if not agents_dir.exists():
-            return {"agents": []}
+        # Clone repository if needed
+        working_dir = clone_repository_if_needed(
+            github_repository.repository_name, ssh_url
+        )
+        logger.info(f"Repository cloned to: {working_dir}")
 
-        agents = []
-        for agent_file in agents_dir.glob("*.md"):
-            with open(agent_file, "r") as f:
-                content = f.read()
-                agents.append(
-                    {
-                        "name": agent_file.stem,
-                        "file_path": str(agent_file),
-                        "content_preview": (
-                            content[:200] + "..." if len(content) > 200 else content
-                        ),
-                    }
-                )
+        # Validate the repository
+        if validate_git_repository(working_dir):
+            # Update config with new workflow information
+            config[workflow_key] = {
+                "project_id": project_id,
+                "workflow_id": workflow_id,
+                "working_directory": working_dir,
+                "repository_name": github_repository.repository_name,
+                "repository_owner": github_repository.repository_owner,
+                "repository_full_name": github_repository.repository_full_name,
+                "initialized_at": time.time(),
+                "last_accessed": time.time(),
+            }
 
-        return {"agents": agents}
+            # Save config file
+            try:
+                with open(config_file_path, "w") as f:
+                    json.dump(config, f, indent=2)
+                logger.info(f"Config saved to: {config_file_path}")
+            except IOError as e:
+                logger.error(f"Failed to save config file: {e}")
+                # Continue execution even if config save fails
+
+            return {
+                "success": True,
+                "project_id": project_id,
+                "workflow_id": workflow_id,
+                "repository_path": working_dir,
+                "repository_name": github_repository.repository_name,
+                "repository_owner": github_repository.repository_owner,
+                "message": f"Workflow {workflow_id} for project {project_id} initialized successfully with repository {github_repository.repository_name}",
+                "already_initialized": False,
+            }
+        else:
+            raise Exception(f"Repository validation failed for: {working_dir}")
 
     except Exception as e:
-        logger.error(f"Error listing agents: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            f"Error initializing workflow {workflow_id} for project {project_id}: {str(e)}"
+        )
+        return {
+            "success": False,
+            "project_id": project_id,
+            "workflow_id": workflow_id,
+            "error": str(e),
+            "message": f"Failed to initialize workflow {workflow_id} for project {project_id}",
+        }
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=4567, reload=True, log_level="info")
+    run("main:app", host="0.0.0.0", port=4567, reload=True, log_level="info")
